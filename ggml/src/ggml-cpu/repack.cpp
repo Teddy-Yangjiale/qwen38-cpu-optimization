@@ -11,7 +11,10 @@
 
 #include "arch-fallback.h"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <cstdint>
 #include <cstring>
 #include <cassert>
 #include <cstdio>  // for GGML_ASSERT
@@ -4554,7 +4557,7 @@ class tensor_traits_base : public ggml::cpu::tensor_traits {
 
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PARAM_TYPE> class tensor_traits : public tensor_traits_base {
 
-    bool work_size(int /* n_threads */, const struct ggml_tensor * op, size_t & size) override {
+    bool work_size(int n_threads, const struct ggml_tensor * op, size_t & size) override {
         // not realy a GGML_TYPE_Q8_0 but same size.
         switch (op->op) {
             case GGML_OP_MUL_MAT:
@@ -4564,15 +4567,25 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 }
             case GGML_OP_MUL_MAT_ID:
                 {
-                    size = ggml_row_size(PARAM_TYPE, ggml_nelements(op->src[1]));
-                    size = GGML_PAD(size, sizeof(int64_t)); // + padding for next block.
-
+                    const int64_t ne01 = op->src[0]->ne[1]; // output cols per expert
                     const int64_t ne02 = op->src[0]->ne[2]; // n_as, n_expert
+                    const int64_t ne10 = op->src[1]->ne[0];
                     const int64_t ne12 = op->src[1]->ne[2]; // n_tokens
+                    const int64_t n_ids = op->src[2]->ne[0]; // n_expert_used
+
+                    // grouped mode stores one packed copy per (token, expert) pair, gemv mode one per token row;
+                    // reserve the larger of the two
+                    const size_t rows_flat    = ggml_nelements(op->src[1]) / ne10;
+                    const size_t rows_grouped = (size_t) n_ids * ne12;
+                    size = ggml_row_size(PARAM_TYPE, ne10) * std::max(rows_flat, rows_grouped);
+                    size = GGML_PAD(size, sizeof(int64_t)); // + padding for next block.
 
                     const size_t sizeof_mmid_row_mapping = sizeof(int64_t);
 
                     size += sizeof_mmid_row_mapping*ne02*(ne12 + 1);
+                    size += sizeof(int64_t)*(ne02 + 1);          // row_offsets
+                    size  = GGML_PAD(size, 64);
+                    size += (size_t) n_threads * mmid_scratch_size(ne10, ne01);
 
                     return true;
                 }
@@ -4780,6 +4793,20 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         }
     }
 
+    // per-thread scratch for the grouped MoE path: 4 gathered F32 rows + a 4 x ne01 output tile
+    static size_t mmid_scratch_size(int64_t ne10, int64_t ne01) {
+        return GGML_PAD(4 * ne10 * sizeof(float), 64) + GGML_PAD(4 * GGML_PAD(ne01, 16) * sizeof(float), 64);
+    }
+
+    // GGML_REPACK_MMID_GEMV=1 restores the one-gemv-per-token behaviour (A/B testing)
+    static bool mmid_use_gemm() {
+        static const bool use_gemm = [] {
+            const char * env = getenv("GGML_REPACK_MMID_GEMV");
+            return !(env != NULL && atoi(env) != 0);
+        }();
+        return use_gemm;
+    }
+
     void forward_mul_mat_id(ggml_compute_params * params, ggml_tensor * op) {
         const ggml_tensor * src0 = op->src[0];
         const ggml_tensor * src1 = op->src[1];
@@ -4822,28 +4849,37 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             int32_t i2;
         };
 
-        GGML_ASSERT(params->wsize >=
-                (GGML_PAD(nbw3, sizeof(int64_t)) +
-                 n_as*(ne12 + 1)*sizeof(mmid_row_mapping))
-                );
+        // grouped (gemm) mode packs the rows routed to each expert in groups of 4 so the expert's
+        // weights are streamed once per 4 tokens instead of once per token; decode (1 token) is
+        // unaffected because every expert then has a single row and takes the gemv path
+        const bool use_gemm = mmid_use_gemm() && ne12 > 1;
+
+        const size_t rows_bytes = use_gemm ? nbw1 * (size_t) n_ids * ne12 : nbw3;
 
         auto * wdata          = (char *)params->wdata;
-        auto * wdata_src1_end = (char *)wdata + GGML_PAD(nbw3, sizeof(int64_t));
+        auto * wdata_src1_end = (char *)wdata + GGML_PAD(std::max(rows_bytes, nbw3), sizeof(int64_t));
 
         // total of [n_as][ne12 + 1] elements of type mmid_row_mapping (2*int32_t = int64_t)
         auto * matrix_row_counts = (int64_t *) (wdata_src1_end);                                        // [n_as]
         struct mmid_row_mapping * matrix_rows = (struct mmid_row_mapping *) (matrix_row_counts + n_as); // [n_as][ne12]
+        int64_t * row_offsets = (int64_t *) (matrix_rows + (size_t) n_as * ne12);                       // [n_as + 1]
+        char * scratch_base = (char *) GGML_PAD((uintptr_t) (row_offsets + n_as + 1), 64);
+        const size_t scratch_slot = mmid_scratch_size(ne10, ne01);
 
-        // src1: float32 => param type
-        for (int64_t i12 = 0; i12 < ne12; ++i12) {
-            for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
-                from_float((float *)((char *) src1->data + i12 * nb12 + i11 * nb11),
-                           (void *)               (wdata + i12 * nbw2 + i11 * nbw1),
-                           ne10);
-            }
-        }
+        GGML_ASSERT(params->wsize >= (size_t) ((scratch_base - wdata) + (use_gemm ? (size_t) nth * scratch_slot : 0)));
 
 #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id) * ne12 + (i1)]
+
+        if (!use_gemm) {
+            // src1: float32 => param type, one quantized copy per src1 row
+            for (int64_t i12 = 0; i12 < ne12; ++i12) {
+                for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
+                    from_float((float *)((char *) src1->data + i12 * nb12 + i11 * nb11),
+                               (void *)               (wdata + i12 * nbw2 + i11 * nbw1),
+                               ne10);
+                }
+            }
+        }
 
         if (ith == 0) {
             // initialize matrix_row_counts
@@ -4861,9 +4897,51 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     matrix_row_counts[i02] += 1;
                 }
             }
+
+            if (use_gemm) {
+                row_offsets[0] = 0;
+                for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+                    row_offsets[cur_a + 1] = row_offsets[cur_a] + matrix_row_counts[cur_a];
+                }
+                GGML_ASSERT((size_t) row_offsets[n_as] * nbw1 <= rows_bytes);
+            }
         }
 
         ggml_barrier(params->threadpool);
+
+        if (use_gemm) {
+            // pack each expert's routed rows: groups of 4 rows in the 4-row interleaved layout the gemm
+            // kernel consumes, leftover rows as plain quantized rows for gemv; work items are spread
+            // round-robin over the threads
+            float * gather = (float *) (scratch_base + (size_t) ith * scratch_slot);
+            int64_t item = 0;
+            for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+                const int64_t cne1 = matrix_row_counts[cur_a];
+                if (cne1 == 0) {
+                    continue;
+                }
+                char * packed_base = wdata + (size_t) row_offsets[cur_a] * nbw1;
+                const int64_t ngroups = cne1 / 4;
+                for (int64_t g = (ith - item % nth + nth) % nth; g < ngroups; g += nth) {
+                    for (int r = 0; r < 4; ++r) {
+                        const struct mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, 4*g + r);
+                        const float * src_row = (const float *) ((const char *) src1->data + (rm.i1 % ne11) * nb11 + rm.i2 * nb12);
+                        memcpy(gather + (size_t) r * ne10, src_row, ne10 * sizeof(float));
+                    }
+                    ggml_quantize_mat_t<INTER_SIZE, PARAM_TYPE>(gather, packed_base + (size_t) g * 4 * nbw1, 4, ne10);
+                }
+                item += ngroups;
+                const int64_t tail_start = 4*ngroups;
+                for (int64_t t = tail_start + (ith - item % nth + nth) % nth; t < cne1; t += nth) {
+                    const struct mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, t);
+                    from_float((const float *) ((const char *) src1->data + (rm.i1 % ne11) * nb11 + rm.i2 * nb12),
+                               packed_base + (size_t) t * nbw1, ne10);
+                }
+                item += cne1 - tail_start;
+            }
+
+            ggml_barrier(params->threadpool);
+        }
 
         // compute each matrix multiplication in sequence
         for (int cur_a = 0; cur_a < n_as; ++cur_a) {
@@ -4892,6 +4970,37 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 return;
             }
 
+            const int64_t ncols = src0_cur_end - src0_cur_start;
+
+            if (use_gemm) {
+                const char * packed_base = wdata + (size_t) row_offsets[cur_a] * nbw1;
+                const int64_t ngroups = nr1 / 4;
+
+                // gemm writes a dense 4 x ncols tile; the rows are then scattered to their (expert slot, token) slots
+                float * tile = (float *) (scratch_base + (size_t) ith * scratch_slot + GGML_PAD(4 * ne10 * sizeof(float), 64));
+                const int64_t tile_stride = GGML_PAD(ncols, 16);
+
+                for (int64_t g = 0; g < ngroups; ++g) {
+                    gemm<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
+                        ne00, tile, tile_stride,
+                        src0_cur + src0_cur_start * nb01, packed_base + (size_t) g * 4 * nbw1, 4, ncols);
+
+                    for (int r = 0; r < 4; ++r) {
+                        const struct mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, 4*g + r);
+                        float * dst_row = (float *) ((char *) dst->data + (rm.i1 * nb1 + rm.i2 * nb2)) + src0_cur_start;
+                        memcpy(dst_row, tile + (size_t) r * tile_stride, ncols * sizeof(float));
+                    }
+                }
+
+                for (int64_t t = 4*ngroups; t < nr1; ++t) {
+                    const struct mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, t);
+                    gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
+                        ne00, (float *) ((char *) dst->data + (rm.i1 * nb1 + rm.i2 * nb2)) + src0_cur_start, ne01,
+                        src0_cur + src0_cur_start * nb01, packed_base + (size_t) t * nbw1, 1, ncols);
+                }
+                continue;
+            }
+
             for (int ir1 = 0; ir1 < nr1; ir1++) {
                 struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1);
 
@@ -4907,7 +5016,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
                 gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
                     ne00, (float *) ((char *) dst->data + (i1 * nb1 + i2 * nb2)) + src0_cur_start, ne01,
-                    src0_cur + src0_cur_start * nb01, src1_col, 1, src0_cur_end - src0_cur_start);
+                    src0_cur + src0_cur_start * nb01, src1_col, 1, ncols);
             }
         }
 #undef MMID_MATRIX_ROW
