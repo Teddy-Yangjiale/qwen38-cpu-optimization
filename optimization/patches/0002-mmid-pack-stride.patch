@@ -1,0 +1,33 @@
+--- a/ggml/src/ggml-cpu/repack.cpp
++++ b/ggml/src/ggml-cpu/repack.cpp
+@@ -4922,10 +4922,7 @@
+                 }
+                 char * packed_base = wdata + (size_t) row_offsets[cur_a] * nbw1;
+                 const int64_t ngroups = cne1 / 4;
+-                for (int64_t g = 0; g < ngroups; ++g, ++item) {
+-                    if (item % nth != ith) {
+-                        continue;
+-                    }
++                for (int64_t g = (ith - item % nth + nth) % nth; g < ngroups; g += nth) {
+                     for (int r = 0; r < 4; ++r) {
+                         const struct mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, 4*g + r);
+                         const float * src_row = (const float *) ((const char *) src1->data + (rm.i1 % ne11) * nb11 + rm.i2 * nb12);
+@@ -4933,14 +4930,14 @@
+                     }
+                     ggml_quantize_mat_t<INTER_SIZE, PARAM_TYPE>(gather, packed_base + (size_t) g * 4 * nbw1, 4, ne10);
+                 }
+-                for (int64_t t = 4*ngroups; t < cne1; ++t, ++item) {
+-                    if (item % nth != ith) {
+-                        continue;
+-                    }
++                item += ngroups;
++                const int64_t tail_start = 4*ngroups;
++                for (int64_t t = tail_start + (ith - item % nth + nth) % nth; t < cne1; t += nth) {
+                     const struct mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, t);
+                     from_float((const float *) ((const char *) src1->data + (rm.i1 % ne11) * nb11 + rm.i2 * nb12),
+                                packed_base + (size_t) t * nbw1, ne10);
+                 }
++                item += cne1 - tail_start;
+             }
+ 
+             ggml_barrier(params->threadpool);
